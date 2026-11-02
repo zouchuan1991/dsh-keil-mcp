@@ -7,6 +7,7 @@ through the per-probe lease (blueprint §7.5).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import List, Optional
 
 from .context import get_context
@@ -150,17 +151,80 @@ async def probe_read_memory(address: int, length: int = 64, probe_id: str = "def
             return {"success": False, "error": str(e)}
 
 
-async def read_rtt_log(probe_id: str = "default", timeout_seconds: int = 3) -> dict:
+_RTT_MAGIC = b"SEGGER RTT"
+# The generic CoreSightTarget has no usable device memory map (pyOCD falls back
+# to a fake 512 MB "SRAM" region), so scan a bounded window instead.
+_RTT_SCAN_BASE = 0x20000000
+_RTT_SCAN_SIZE = 0x10000
+
+
+def _find_rtt_control_block(target, magic: bytes = _RTT_MAGIC) -> Optional[int]:
+    """Scan RAM for the "SEGGER RTT" magic; tolerant of unmapped chunks."""
+    addr = _RTT_SCAN_BASE
+    end = _RTT_SCAN_BASE + _RTT_SCAN_SIZE
+    overlap = len(magic) - 1
+    prev = b""
+    while addr < end:
+        size = min(1024, end - addr)
+        try:
+            data = bytes(target.read_memory_block8(addr, size))
+        except Exception:
+            prev = b""
+            addr += size
+            continue
+        idx = (prev + data).find(magic)
+        if idx >= 0:
+            return addr - len(prev) + idx
+        prev = (prev + data)[-overlap:] if overlap else b""
+        addr += size
+    return None
+
+
+async def read_rtt_log(probe_id: str = "default", timeout_seconds: int = 3,
+                       channel: int = 0, rtt_address: int = 0) -> dict:
     """Read recent SEGGER RTT log output from the target (if RTT is running)."""
     ctx = get_context()
     async with ctx.lease.acquire(probe_id):
         try:
-            from pyocd.rtt import RTT
+            # pyOCD exposes the channel based API in pyocd.debug.rtt; the old
+            # pyocd.rtt.RTT facade module does not exist in any release.
+            from pyocd.debug.rtt import RTTControlBlock
+
             s = _session(probe_id)
-            rtt = RTT(s)
-            rtt.start()
-            text = rtt.read(0)
-            rtt.stop()
-            return {"success": True, "rtt_log": text.decode("utf-8", errors="replace")[-4000:]}
+            t = s.target
+            cb_addr = rtt_address or _find_rtt_control_block(t)
+            if not cb_addr:
+                return {"success": False,
+                        "error": "SEGGER RTT control block not found in "
+                                 "0x%08x-0x%08x; pass rtt_address if the RTT "
+                                 "buffer lives elsewhere"
+                                 % (_RTT_SCAN_BASE, _RTT_SCAN_BASE + _RTT_SCAN_SIZE)}
+
+            cb = RTTControlBlock.from_target(t, address=cb_addr, size=0)
+            cb.start()
+            names = [c.name for c in cb.up_channels]
+            if channel < 0 or channel >= len(cb.up_channels):
+                return {"success": False,
+                        "error": "up channel %d not found (have %d)" % (channel, len(names)),
+                        "channels": names}
+
+            ch = cb.up_channels[channel]
+            chunks: List[bytes] = []
+            deadline = time.monotonic() + max(0, timeout_seconds)
+            while True:
+                data = ch.read()
+                if data:
+                    chunks.append(data)
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.05)
+
+            raw = b"".join(chunks)
+            return {"success": True,
+                    "rtt_log": raw.decode("utf-8", errors="replace")[-4000:],
+                    "bytes": len(raw),
+                    "channel": channel,
+                    "channels": names,
+                    "control_block": "0x%08x" % cb_addr}
         except Exception as e:
             return {"success": False, "error": str(e)}
