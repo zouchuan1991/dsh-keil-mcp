@@ -19,9 +19,16 @@ def _session(probe_id: str = "default"):
     from pyocd.core.helpers import ConnectHelper
     s = _probe_cache.get(probe_id)
     if s is None:
+        # connect_mode='attach'：连接时既不 reset 也不 halt，仅通过 DAP 做内存/寄存器访问。
+        # pyOCD 默认 'halt' 会在 open() 时 halt 内核；本工程 FWDGT 未开 debug suspend
+        # （DBG_CTL.FWDGT_SUSP），halt 期间看门狗照常计数，超过喂狗窗口即触发 FWDGTRST，
+        # 造成"冷启动/复位"假象（曾误判 18s/58s 复位）。attach 让内核全程正常运行、正常喂狗。
         s = ConnectHelper.session_with_chosen_probe(
             unique_id=probe_id if probe_id != "default" else None,
-            options={"target_override": None})
+            options={
+                "target_override": None,
+                "connect_mode": "attach",
+            })
         s.open()
         _probe_cache[probe_id] = s
     return s
